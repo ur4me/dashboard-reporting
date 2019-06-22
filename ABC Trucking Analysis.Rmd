@@ -1,0 +1,208 @@
+---
+title: "ABC Trucking Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+    
+Row
+-------------------------------------
+    
+### Drivers That Need Attention
+    
+```{r}
+#preparation
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(leaflet)
+library(rgeos)
+library(geosphere)
+library(DT)
+library(gridExtra)
+
+#read data
+speeds <- read.csv('C:/Eroad/speeds.csv',na.strings = c("", "NA"), stringsAsFactors = F)
+
+road_segments <- read.csv('C:/Eroad/road-segments.csv',header = T, sep=";", stringsAsFactors = F)
+
+virtual_speed_camera <- read.csv('C:/Eroad/virtual-speed-camera.csv',header = F, sep=";", stringsAsFactors = F)
+virtual_speed_camera <- data.frame(camera = virtual_speed_camera[2,])
+
+## Question1
+df <- speeds %>% left_join(road_segments, by = c("road_segment_id" = "id")) 
+df$event_timestamp <- ymd_hms(df$event_timestamp)
+df <- df %>% arrange(machine_id,event_timestamp)
+
+#reduce size and modify location error
+error <- df[df$id ==8236668166,]
+df[df$id ==8236668166,'longitude'] <- error$latitude
+df[df$id ==8236668166,'latitude'] <- error$longitude
+
+df$lag.long <- lag(df$longitude,1)
+df$lag.lat <- lag(df$latitude,1)
+
+df$dist <- NA
+
+for(i in (1:nrow(df))) {
+  df$dist[i] <- distm(c(df$longitude[i], df$latitude[i]), c(df$lag.long[i], df$lag.lat[i]), fun = distHaversine)
+}
+
+df$dist <- ifelse(df$machine_id != lag(df$machine_id,1), NA, df$dist)
+
+df <- df %>% filter(dist > 50 | is.na(dist))
+
+
+#I assume that speed cannot be faster than 250kp. Those could be outliers(machine error) so I will remove those observations.
+df <- df %>% filter(speed_gps_kph < 250)
+
+drivers <- df %>% group_by(machine_id) %>% summarise(speed_gps_kph = mean(speed_gps_kph), total_events= n()) 
+
+drivers_exceed_100 <-df %>% filter(speed_gps_kph > 100) %>%  group_by(machine_id) %>% summarise(exceed_numbers= n()) 
+
+drivers <- drivers %>% left_join(drivers_exceed_100, by = c("machine_id"))
+drivers$exceed_numbers[is.na(drivers$exceed_numbers)] <- 0
+drivers$exceed_proportion <- drivers$exceed_numbers/drivers$total_events 
+drivers$speed_gps_kph <- round(drivers$speed_gps_kph,2)
+drivers$exceed_proportion <- round(drivers$exceed_proportion,2)
+
+#summary into table
+bad_drivers <- drivers %>% filter(speed_gps_kph > 100) %>% arrange(desc(speed_gps_kph),desc(exceed_proportion) )
+#DT::datatable(bad_drivers, rownames = F, options = list(searching = FALSE,pageLength = 5)) 
+knitr::kable(bad_drivers)
+
+```
+   
+### Good Drivers
+    
+```{r}
+good_drivers <- drivers %>% filter(exceed_proportion == 0) %>% arrange(desc(speed_gps_kph),desc(total_events) )
+#DT::datatable(good_drivers, rownames = F, options = list(searching = FALSE,pageLength = 5)) 
+knitr::kable(good_drivers)
+
+```
+
+Row
+-------------------------------------
+    
+### Average Speed vs Time
+    
+```{r}
+## Question2
+df$hour <- hour(df$event_timestamp)
+df$day <- day(df$event_timestamp)
+df$day_of_week <- weekdays(as.Date(df$event_timestamp))
+
+#group by hour and day
+hour <- df %>% group_by(hour) %>% summarise(speed_gps_kph = mean(speed_gps_kph))
+day <- df %>% group_by(day) %>% summarise(speed_gps_kph = mean(speed_gps_kph))
+
+h <- ggplot(data=hour,
+       aes(x=hour, y=speed_gps_kph)) + geom_line()
+d <- ggplot(data=day,
+            aes(x=day, y=speed_gps_kph)) + geom_line() + geom_smooth(method = 'lm')
+
+grid.arrange(d, h, nrow = 1)
+```
+    
+### Direction Comparison
+    
+```{r}
+## Question3
+
+#determine latitude
+
+df$lat_diff <-  df$latitude - lag(df$latitude,1)
+
+df$direction <- ifelse(df$lat_diff <0, 'going southbound','going northbound')
+df$direction <- ifelse(df$machine_id != lag(df$machine_id,1), NA, df$direction)
+
+going_southbound <- df %>% filter(direction == 'going southbound')
+going_northbound <- df %>% filter(direction == 'going northbound')
+
+direction <- data.frame(direction = c('going_southbound','going_northbound') ,
+                        average_speed_gps_kph =c(mean(going_southbound$speed_gps_kph), mean(going_northbound$speed_gps_kph)))
+
+ggplot(data=direction, aes(x=direction, y=average_speed_gps_kph, fill=direction)) + geom_bar(stat="identity", position="dodge")
+
+```
+    
+### Average Speed Through the Virtual Speed Camera
+    
+```{r} 
+    
+## Question5
+
+virtual_speed_camera$camera <- as.character(virtual_speed_camera$camera)
+split <- strsplit(virtual_speed_camera$camera,' ')
+virtual_speed_camera <- matrix(split[[1]], ncol=2, byrow=TRUE)
+virtual_speed_camera <- as.data.frame(virtual_speed_camera, stringsAsFactors=FALSE)
+colnames(virtual_speed_camera) <- c('longitude','latitude')
+virtual_speed_camera$longitude <- gsub('POLYGON','',virtual_speed_camera$longitude)
+virtual_speed_camera$longitude <- as.numeric(gsub('[(]','',virtual_speed_camera$longitude))
+virtual_speed_camera$latitude <- gsub(',','',virtual_speed_camera$latitude)
+virtual_speed_camera$latitude <- as.numeric(gsub('[)])','',virtual_speed_camera$latitude))
+
+#change to SpatialPolygonsDataFrame
+library(sp)
+p = Polygon(virtual_speed_camera)
+ps = Polygons(list(p),1)
+sps = SpatialPolygons(list(ps))
+
+proj4string(sps) = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+data = data.frame(f=99.9)
+spdf = SpatialPolygonsDataFrame(sps,data)
+
+#add speed camera column
+dat <- df %>% select(longitude, latitude)
+df$camera <- NA
+
+for (i in 1:nrow(dat)) {
+  dat1 <- dat[i,]
+  
+  spdf2   <- SpatialPoints(dat1,proj4string=CRS(proj4string(spdf)))
+  df$camera[i] <- gContains(spdf,spdf2)
+}
+
+camera_zone_yes <- df %>% filter(camera =='TRUE')
+camera_zone_no <- df %>% filter(camera =='FALSE')
+
+#group by machine_id
+
+bad_drivers_camera <- camera_zone_yes %>% group_by(machine_id) %>% 
+  summarise(speed_gps_kph = mean(speed_gps_kph)) %>% arrange(desc(speed_gps_kph)) %>% filter(speed_gps_kph > 100)
+
+knitr::kable(bad_drivers_camera)
+
+```
+
+
+
+### Road with the Highest Average Speed
+    
+```{r}
+road <- df %>% group_by(road_segment_id, road_segment) %>% summarise(speed_gps_kph = mean(speed_gps_kph))
+road_speeding <- road$road_segment[road$speed_gps_kph == max(road$speed_gps_kph)]
+
+split <- strsplit(road_speeding,' ')
+road_speeding1 <- matrix(split[[1]], ncol=2, byrow=TRUE)
+road_speeding1 <- as.data.frame(road_speeding1, stringsAsFactors=FALSE)
+colnames(road_speeding1) <- c('longitude','latitude')
+road_speeding1$longitude <- gsub('MULTILINESTRING','',road_speeding1$longitude)
+road_speeding1$longitude <- as.numeric(gsub('[(]','',road_speeding1$longitude))
+road_speeding1$latitude <- gsub(',','',road_speeding1$latitude)
+road_speeding1$latitude <- as.numeric(gsub('[)])','',road_speeding1$latitude))
+
+library("leaflet")
+leaflet() %>%
+  addTiles() %>% addProviderTiles(providers$OpenStreetMap) %>%
+  addPolylines(
+    data = road_speeding1,
+    lng = ~longitude, 
+    lat = ~latitude,
+    weight = 10,
+    opacity = 0.5, color = "#ff0033"
+  ) 
+```
+    
